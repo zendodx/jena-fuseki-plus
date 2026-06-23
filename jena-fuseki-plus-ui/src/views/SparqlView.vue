@@ -85,6 +85,14 @@
             style="margin-left:4px"
             :title="`结果超过 ${WARN_THRESHOLD} 条，建议查询时加 LIMIT 限制返回数量`"
           >⚠ 结果过多，建议加 LIMIT</el-tag>
+          <!-- 多选操作区 -->
+          <template v-if="selectedRows.length > 0">
+            <el-tag type="primary" size="small" effect="dark" style="flex-shrink:0">
+              已选 {{ selectedRows.length }} 条
+            </el-tag>
+            <el-button size="small" type="success" plain :icon="DocumentCopy" @click="openJsonDialog">导出 JSON</el-button>
+            <el-button size="small" plain @click="clearSelection">取消选择</el-button>
+          </template>
           <div style="flex:1"></div>
           <el-button size="small" @click="exportCSV" :icon="Download">导出 CSV</el-button>
           <el-button size="small" @click="viewAsGraph" :icon="Share" type="primary" plain>
@@ -95,13 +103,16 @@
         <!-- 结果表格 -->
         <div class="result-table-wrap" v-if="queryResult?.results?.bindings?.length">
           <el-table
+            ref="resultTableRef"
             :data="pagedTableData"
             border
             stripe
             height="100%"
             size="small"
             style="width:100%"
+            @selection-change="onSelectionChange"
           >
+            <el-table-column type="selection" width="42" fixed />
             <el-table-column
               v-for="col in tableColumns"
               :key="col"
@@ -134,6 +145,30 @@
           <el-empty description="执行查询后显示结果" :image-size="100" />
         </div>
 
+        <!-- JSON 导出弹窗 -->
+        <el-dialog
+          v-model="jsonDialogVisible"
+          title="导出 JSON"
+          width="700px"
+          :append-to-body="true"
+          destroy-on-close
+        >
+          <div class="json-dialog-toolbar">
+            <span class="json-dialog-info">共 <b>{{ selectedRows.length }}</b> 条记录</span>
+            <div style="flex:1"></div>
+            <el-radio-group v-model="jsonFormat" size="small" style="margin-right:8px">
+              <el-radio-button value="pretty">格式化</el-radio-button>
+              <el-radio-button value="compact">压缩</el-radio-button>
+              <el-radio-button value="sparql">SPARQL 原始</el-radio-button>
+            </el-radio-group>
+            <el-button size="small" :icon="DocumentCopy" @click="copyJson">复制</el-button>
+            <el-button size="small" type="primary" :icon="Download" @click="saveJson">保存文件</el-button>
+          </div>
+          <div class="json-preview-wrap">
+            <pre class="json-preview" ref="jsonPreviewRef">{{ jsonPreviewText }}</pre>
+          </div>
+        </el-dialog>
+
         <!-- 分页控件 -->
         <div class="result-pagination" v-if="totalPages > 1">
           <el-pagination
@@ -161,6 +196,7 @@ import {
   Clock,
   CopyDocument,
   Delete,
+  DocumentCopy,
   Download,
   Edit,
   Share,
@@ -771,6 +807,7 @@ async function runQuery() {
   queryError.value = ''
   queryResult.value = null
   currentPage.value = 1
+  resetSelection()
   try {
     const ds = datasets.value.find(d => d.name === selectedDataset.value)
     const datasetPath = ds?.path || ('/' + selectedDataset.value)
@@ -1046,6 +1083,91 @@ const pagedTableData = computed(() => {
 function onPageSizeChange(size) {
   PAGE_SIZE.value = size
   currentPage.value = 1
+  clearSelection()
+}
+
+// ─── 表格多选 ───────────────────────────────────────────────────────────────
+const resultTableRef = ref(null)
+const selectedRows = ref([])
+
+function onSelectionChange(rows) {
+  selectedRows.value = rows
+}
+
+function clearSelection() {
+  resultTableRef.value?.clearSelection()
+  selectedRows.value = []
+}
+
+// 查询新结果时自动清除选中状态
+function resetSelection() {
+  selectedRows.value = []
+}
+
+// ─── JSON 导出弹窗 ────────────────────────────────────────────────────────
+const jsonDialogVisible = ref(false)
+const jsonFormat = ref('pretty')   // 'pretty' | 'compact' | 'sparql'
+const jsonPreviewRef = ref(null)
+
+/** 根据格式选项生成展示文本 */
+const jsonPreviewText = computed(() => {
+  const rows = selectedRows.value
+  if (!rows.length) return '[]'
+
+  if (jsonFormat.value === 'compact') {
+    return JSON.stringify(rows)
+  }
+
+  if (jsonFormat.value === 'sparql') {
+    // 返回 SPARQL JSON 原始格式：{ head: { vars }, results: { bindings } }
+    const vars = tableColumns.value
+    const bindings = rows.map(row => {
+      const binding = {}
+      vars.forEach(col => {
+        const val = row[col]
+        if (val !== undefined && val !== '') {
+          binding[col] = isUri(val)
+            ? { type: 'uri', value: val }
+            : { type: 'literal', value: val }
+        }
+      })
+      return binding
+    })
+    return JSON.stringify({ head: { vars }, results: { bindings } }, null, 2)
+  }
+
+  // 默认格式化
+  return JSON.stringify(rows, null, 2)
+})
+
+function openJsonDialog() {
+  if (!selectedRows.value.length) {
+    ElMessage.warning('请先选择至少一条记录')
+    return
+  }
+  jsonDialogVisible.value = true
+}
+
+async function copyJson() {
+  try {
+    await navigator.clipboard.writeText(jsonPreviewText.value)
+    ElMessage.success({ message: 'JSON 已复制到剪贴板', duration: 1500 })
+  } catch {
+    ElMessage.error('复制失败，请手动复制')
+  }
+}
+
+function saveJson() {
+  const text = jsonPreviewText.value
+  const blob = new Blob([text], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  a.href = url
+  a.download = `sparql-result-${ts}.json`
+  a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success({ message: 'JSON 文件已保存', duration: 1500 })
 }
 
 function isUri(val) {
@@ -1333,6 +1455,44 @@ LIMIT 20`,
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* JSON 导出弹窗 */
+.json-dialog-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #f0f0f0;
+  margin-bottom: 12px;
+}
+.json-dialog-info {
+  font-size: 13px;
+  color: #606266;
+  flex-shrink: 0;
+}
+.json-preview-wrap {
+  height: 480px;
+  overflow: auto;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  background: #1e1e2e;
+}
+.json-preview {
+  margin: 0;
+  padding: 16px;
+  font-family: 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: #cdd6f4;
+  white-space: pre;
+  tab-size: 2;
+  /* JSON 语法着色（纯 CSS）*/
+}
+/* 弹窗底部不需要额外间距 */
+:deep(.el-dialog__body) {
+  padding-top: 16px;
+  padding-bottom: 16px;
 }
 </style>
 
