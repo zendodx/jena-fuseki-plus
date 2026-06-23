@@ -38,9 +38,9 @@
       <span class="hint">Ctrl+Enter 执行 · Ctrl+Space 补全 · Tab 缩进 · 双击示例加载</span>
     </div>
 
-    <div class="editor-result">
+    <div class="editor-result" ref="editorResultRef">
       <!-- 左侧编辑器 + 示例 -->
-      <div class="editor-wrap">
+      <div class="editor-wrap" :style="{ width: editorWidth + 'px' }">
         <!-- CodeMirror 编辑器挂载点 -->
         <div class="editor-area">
           <div ref="cmContainer" class="cm-container"></div>
@@ -58,6 +58,13 @@
             <div class="ex-desc">{{ ex.desc }}</div>
           </div>
         </div>
+      </div>
+
+      <!-- 拖拽分割条 -->
+      <div class="resizer" @mousedown="startResize"
+        :class="{ 'resizer-active': isResizing }"
+        title="拖拽调整编辑器宽度">
+        <div class="resizer-handle"></div>
       </div>
 
       <!-- 右侧结果 -->
@@ -171,6 +178,41 @@ const sparqlHighlightStyle = HighlightStyle.define([
   // 括号
   { tag: tags.bracket,          color: '#24292e' },
 ])
+
+// ─── 拖拽调整编辑器宽度 ────────────────────────────────────────────────────
+const editorWidth = ref(560)   // 默认宽度 px
+const isResizing = ref(false)
+const editorResultRef = ref(null)
+let resizeStartX = 0
+let resizeStartWidth = 0
+
+function startResize(e) {
+  isResizing.value = true
+  resizeStartX = e.clientX
+  resizeStartWidth = editorWidth.value
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+  document.addEventListener('mousemove', onResize)
+  document.addEventListener('mouseup', stopResize)
+  e.preventDefault()
+}
+
+function onResize(e) {
+  if (!isResizing.value) return
+  const container = editorResultRef.value
+  const maxWidth = container ? container.offsetWidth - 200 : 1200
+  const minWidth = 280
+  const delta = e.clientX - resizeStartX
+  editorWidth.value = Math.min(maxWidth, Math.max(minWidth, resizeStartWidth + delta))
+}
+
+function stopResize() {
+  isResizing.value = false
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  document.removeEventListener('mousemove', onResize)
+  document.removeEventListener('mouseup', stopResize)
+}
 
 const datasets = ref([])
 const selectedDataset = ref('')
@@ -442,6 +484,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   editorView?.destroy()
+  document.removeEventListener('mousemove', onResize)
+  document.removeEventListener('mouseup', stopResize)
 })
 
 // 切换数据集时刷新谓词
@@ -792,12 +836,38 @@ LIMIT 20`,
   overflow: hidden;
 }
 .editor-wrap {
-  width: 460px;
-  min-width: 320px;
+  /* width 由 JS 控制，min/max 在 onResize 中限制 */
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid #e4e7ed;
   background: #fff;
+  /* 不设 border-right，由 resizer 代替 */
+}
+
+/* 拖拽分割条 */
+.resizer {
+  width: 6px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: #e4e7ed;
+  position: relative;
+  transition: background 0.15s;
+  user-select: none;
+}
+.resizer:hover,
+.resizer-active {
+  background: #409eff;
+}
+.resizer-handle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2px;
+  height: 32px;
+  border-radius: 2px;
+  background: rgba(255,255,255,0.7);
+  pointer-events: none;
 }
 .editor-area {
   flex: 1;
