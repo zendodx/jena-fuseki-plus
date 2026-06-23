@@ -141,9 +141,36 @@ import {EditorState} from '@codemirror/state'
 import {EditorView, highlightActiveLine, keymap, lineNumbers} from '@codemirror/view'
 import {defaultKeymap, history, historyKeymap, indentWithTab} from '@codemirror/commands'
 import {acceptCompletion, autocompletion, completionKeymap} from '@codemirror/autocomplete'
-import {StreamLanguage} from '@codemirror/language'
-// sparql 用 turtle 流式 language 做基本语法高亮（SPARQL 与 Turtle 关键字部分重叠）
+import {HighlightStyle, StreamLanguage, syntaxHighlighting} from '@codemirror/language'
+import {tags} from '@lezer/highlight'
+// sparql 流式语言模式
 import {sparql as sparqlLang} from '@codemirror/legacy-modes/mode/sparql'
+
+// ── SPARQL 自定义语法高亮主题 ──────────────────────────────────────────────
+const sparqlHighlightStyle = HighlightStyle.define([
+  // 关键词：SELECT WHERE FILTER 等 → 蓝色加粗
+  { tag: tags.keyword,          color: '#0070c1', fontWeight: 'bold' },
+  // 内置函数：STR LANG COUNT 等 → 紫色
+  { tag: tags.standard(tags.name), color: '#7a29a1' },
+  { tag: tags.function(tags.name), color: '#7a29a1' },
+  // 变量 ?s ?p → 橙色
+  { tag: tags.variableName,     color: '#e07b00' },
+  // URI <http://...> 和前缀 → 青绿色
+  { tag: tags.atom,             color: '#008080' },
+  { tag: tags.namespace,        color: '#008080' },
+  // 字符串 → 绿色
+  { tag: tags.string,           color: '#22863a' },
+  // 注释 → 灰色斜体
+  { tag: tags.comment,          color: '#6a737d', fontStyle: 'italic' },
+  // 运算符
+  { tag: tags.operator,         color: '#d73a49' },
+  // 数字
+  { tag: tags.number,           color: '#005cc5' },
+  // 元信息（@ 语言标签等）
+  { tag: tags.meta,             color: '#e36209' },
+  // 括号
+  { tag: tags.bracket,          color: '#24292e' },
+])
 
 const datasets = ref([])
 const selectedDataset = ref('')
@@ -280,6 +307,7 @@ function initEditor() {
       highlightActiveLine(),
       history(),
       StreamLanguage.define(sparqlLang),
+      syntaxHighlighting(sparqlHighlightStyle, { fallback: true }),
       autocompletion({
         override: [sparqlCompletionSource],
         activateOnTyping: true,
@@ -458,22 +486,121 @@ async function runQuery() {
 }
 
 // ─── 格式化 ───────────────────────────────────────────────────────────────
+// 对 SPARQL 查询字符串进行格式化：关键词大写、合理缩进、换行对齐
 function formatQuery() {
-  const keywords = ['SELECT', 'WHERE', 'FILTER', 'OPTIONAL', 'UNION', 'MINUS',
-                    'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'PREFIX',
-                    'ASK', 'CONSTRUCT', 'DESCRIBE', 'INSERT', 'DELETE', 'WITH']
-  let q = sparqlText.value
-  keywords.forEach(kw => {
-    q = q.replace(new RegExp('\\b' + kw + '\\b', 'gi'), kw)
-  })
-  const formatted = q.trim()
-  sparqlText.value = formatted
-  // 同步到 CodeMirror
-  if (editorView) {
-    editorView.dispatch({
-      changes: { from: 0, to: editorView.state.doc.length, insert: formatted }
-    })
+  const raw = sparqlText.value.trim()
+  if (!raw) return
+
+  try {
+    const formatted = sparqlFormat(raw)
+    sparqlText.value = formatted
+    if (editorView) {
+      editorView.dispatch({
+        changes: { from: 0, to: editorView.state.doc.length, insert: formatted }
+      })
+    }
+    ElMessage.success({ message: '格式化完成', duration: 1000 })
+  } catch {
+    ElMessage.warning('格式化失败，请检查查询语法')
   }
+}
+
+/**
+ * 简单但实用的 SPARQL 格式化器
+ * - 关键词统一大写
+ * - 顶级子句（SELECT/WHERE/PREFIX/LIMIT 等）顶格
+ * - { } 内部语句缩进 2 个空格
+ * - 多余空白折叠
+ */
+function sparqlFormat(query) {
+  // ── Step 1: 归一化空白（保留换行语义先压平） ──────────────────────────
+  // 先把所有换行变为空格，再整理
+  let q = query
+    .replace(/\r\n|\r/g, '\n')
+    .replace(/[ \t]+/g, ' ')   // 多空格→单空格（不动换行）
+    .trim()
+
+  // ── Step 2: 关键词大写 ────────────────────────────────────────────────
+  // 仅对边界单词替换，避免动到字符串/URI 内部（简单处理：URI 和字符串先占位）
+  const placeholders = []
+  // 占位 URI <...>
+  q = q.replace(/<[^>]*>/g, (m) => { placeholders.push(m); return `\x00URI${placeholders.length - 1}\x00` })
+  // 占位字符串 "..." '...'
+  q = q.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (m) => { placeholders.push(m); return `\x00STR${placeholders.length - 1}\x00` })
+  // 占位注释 #...
+  q = q.replace(/#[^\n]*/g, (m) => { placeholders.push(m); return `\x00CMT${placeholders.length - 1}\x00` })
+
+  // 关键词列表（注意多词关键词先处理）
+  const KWS = [
+    'NOT EXISTS', 'GROUP CONCAT', 'GROUP BY', 'ORDER BY', 'NOT IN',
+    'SELECT', 'DISTINCT', 'REDUCED', 'WHERE', 'FILTER', 'OPTIONAL', 'UNION', 'MINUS',
+    'GRAPH', 'NAMED', 'SERVICE', 'BIND', 'AS', 'VALUES', 'LET',
+    'HAVING', 'LIMIT', 'OFFSET',
+    'PREFIX', 'BASE', 'ASK', 'CONSTRUCT', 'DESCRIBE',
+    'INSERT DATA', 'DELETE DATA', 'INSERT', 'DELETE', 'WITH', 'LOAD', 'CLEAR',
+    'DROP', 'CREATE', 'COPY', 'MOVE', 'ADD', 'FROM', 'INTO', 'USING',
+    'NOT', 'IN', 'EXISTS',
+    'TRUE', 'FALSE', 'UNDEF',
+    'COUNT', 'SUM', 'MIN', 'MAX', 'AVG', 'SAMPLE',
+  ]
+  for (const kw of KWS) {
+    // \b 边界（多词关键词中间有空格用 \s+）
+    const pat = kw.replace(/ /g, '\\s+')
+    q = q.replace(new RegExp('(?<![\x00\\w])' + pat + '(?![\\w\x00])', 'gi'), kw)
+  }
+
+  // ── Step 3: 换行规则 ──────────────────────────────────────────────────
+  // 先把所有换行压平成空格
+  q = q.replace(/\n/g, ' ').replace(/ {2,}/g, ' ')
+
+  // 顶级关键词前加换行：在"空格 + 顶级关键词"处替换为"\n顶级关键词"
+  // 注意多词关键词（GROUP BY / ORDER BY 等）先处理，避免被单词拆散
+  const TOP_KW = [
+    'INSERT DATA', 'DELETE DATA', 'GROUP BY', 'ORDER BY',
+    'PREFIX', 'BASE', 'SELECT', 'ASK', 'CONSTRUCT', 'DESCRIBE',
+    'INSERT', 'DELETE', 'WITH',
+    'LOAD', 'CLEAR', 'DROP', 'CREATE', 'COPY', 'MOVE', 'ADD',
+    'WHERE', 'FROM', 'NAMED', 'HAVING', 'LIMIT', 'OFFSET', 'VALUES',
+  ]
+  for (const kw of TOP_KW) {
+    // 将字符串中所有 " KEYWORD"（前有空格，后跟空格或{或行尾）替换为 "\nKEYWORD"
+    // 用 replace + 全局匹配，不依赖 lookbehind
+    const pat = kw.replace(/ /g, '\\s+')
+    q = q.replace(new RegExp(' (' + pat + ')(?=[ \\t{]|$)', 'gi'), '\n$1')
+  }
+  // 去掉可能产生的行首多余空格
+  q = q.split('\n').map(l => l.trimStart()).join('\n')
+
+  // ── Step 4: 花括号展开 ────────────────────────────────────────────────
+  // { 后换行，} 前换行
+  q = q
+    .replace(/\{\s*/g, '{\n')
+    .replace(/\s*\}/g, '\n}')
+
+  // ── Step 5: 缩进 ─────────────────────────────────────────────────────
+  const INDENT = '  '
+  let depth = 0
+  const lines = q.split('\n').map(line => line.trim()).filter(l => l.length > 0)
+  const result = []
+  for (const line of lines) {
+    if (line === '}') depth = Math.max(0, depth - 1)
+    result.push(INDENT.repeat(depth) + line)
+    if (line.endsWith('{')) depth++
+  }
+
+  // ── Step 6: 点号分隔三元组换行 ────────────────────────────────────────
+  // depth=1 内部的 . 分隔符后换行（简单：在 . 后（不跟<>）加换行）
+  let out = result.join('\n')
+  // 在 triple 末尾的 . 后换行（不影响 URI 和小数）
+  out = out.replace(/(?<=[^.<>\d]) \. (?=[^}])/g, ' .\n' + INDENT.repeat(1))
+
+  // ── Step 7: 还原占位符 ────────────────────────────────────────────────
+  out = out.replace(/\x00(URI|STR|CMT)(\d+)\x00/g, (_, type, idx) => placeholders[parseInt(idx)])
+
+  // ── Step 8: 清理多余空行 ─────────────────────────────────────────────
+  out = out.replace(/\n{3,}/g, '\n\n').trim()
+
+  return out
 }
 
 function clearQuery() {
