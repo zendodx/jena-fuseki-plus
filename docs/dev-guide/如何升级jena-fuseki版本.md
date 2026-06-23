@@ -1,3 +1,10 @@
+---
+layout: default
+title: Fuseki 版本升级方案
+parent: 开发指南
+nav_order: 3
+---
+
 ## Fuseki 版本升级方案
 
 ### 当前版本依赖清单

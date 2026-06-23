@@ -1,3 +1,10 @@
+---
+layout: default
+title: Jena Fuseki Plus — 整体架构文档
+parent: 开发指南
+nav_order: 1
+---
+
 # Jena Fuseki Plus — 整体架构文档
 
 ## 1. 系统全貌
