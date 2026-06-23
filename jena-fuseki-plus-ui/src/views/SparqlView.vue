@@ -1,0 +1,765 @@
+<template>
+  <div class="sparql-view">
+    <!-- 顶部工具栏 -->
+    <div class="toolbar">
+      <el-select v-model="selectedDataset" placeholder="选择数据集" style="width:200px"
+        @change="onDatasetChange">
+        <el-option v-for="ds in datasets" :key="ds.name" :label="ds.name" :value="ds.name" />
+      </el-select>
+      <el-button type="primary" @click="runQuery" :loading="loading" :icon="VideoPlay">
+        执行查询
+      </el-button>
+      <el-button @click="formatQuery" :icon="Edit">格式化</el-button>
+      <el-button @click="copyAsSingleLine" :icon="CopyDocument" title="复制为单行（去除换行）">复制单行</el-button>
+      <el-button @click="clearQuery" :icon="Delete">清空</el-button>
+      <el-divider direction="vertical" />
+      <!-- 历史记录下拉 -->
+      <el-dropdown v-if="queryHistory.length" @command="loadFromHistory" trigger="click">
+        <el-button :icon="Clock">历史 <el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
+        <template #dropdown>
+          <el-dropdown-menu style="max-width:480px">
+            <el-dropdown-item
+              v-for="(h, i) in queryHistory"
+              :key="i"
+              :command="h"
+              style="font-size:12px;max-width:480px"
+            >
+              <div class="history-item">
+                <span class="history-ds">{{ h.dataset }}</span>
+                <span class="history-preview">{{ h.preview }}</span>
+                <span class="history-time">{{ h.time }}</span>
+              </div>
+            </el-dropdown-item>
+            <el-dropdown-item divided command="__clear__" style="color:#f56c6c;font-size:12px">清空历史</el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
+      <el-divider direction="vertical" />
+      <span class="hint">Ctrl+Enter 执行 · Ctrl+Space 补全 · Tab 缩进 · 双击示例加载</span>
+    </div>
+
+    <div class="editor-result">
+      <!-- 左侧编辑器 + 示例 -->
+      <div class="editor-wrap">
+        <!-- CodeMirror 编辑器挂载点 -->
+        <div class="editor-area">
+          <div ref="cmContainer" class="cm-container"></div>
+          <div v-if="queryError" class="error-bar">
+            <el-icon><WarningFilled /></el-icon> {{ queryError }}
+          </div>
+        </div>
+
+        <!-- 示例查询 -->
+        <div class="examples-panel">
+          <div class="examples-title">示例查询</div>
+          <div v-for="ex in examples" :key="ex.name"
+            class="example-item" @dblclick="loadExample(ex)">
+            <div class="ex-name">{{ ex.name }}</div>
+            <div class="ex-desc">{{ ex.desc }}</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右侧结果 -->
+      <div class="result-wrap">
+        <div class="result-header" v-if="queryResult">
+          <span class="result-count">
+            共 {{ queryResult.results?.bindings?.length || 0 }} 条结果
+          </span>
+          <el-button size="small" @click="exportCSV" :icon="Download">导出 CSV</el-button>
+          <el-button size="small" @click="viewAsGraph" :icon="Share" type="primary" plain>
+            在图谱中查看
+          </el-button>
+        </div>
+
+        <!-- 结果表格 -->
+        <div class="result-table-wrap" v-if="queryResult?.results?.bindings?.length">
+          <el-table
+            :data="tableData"
+            border
+            stripe
+            height="100%"
+            size="small"
+            style="width:100%"
+          >
+            <el-table-column
+              v-for="col in tableColumns"
+              :key="col"
+              :prop="col"
+              :label="col"
+              min-width="160"
+              show-overflow-tooltip
+            >
+              <template #default="{ row }">
+                <span
+                  :class="{ 'uri-cell': isUri(row[col]) }"
+                  @click="isUri(row[col]) && copyUri(row[col])"
+                  :title="row[col]"
+                >{{ row[col] }}</span>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+
+        <!-- ASK 结果 -->
+        <div class="ask-result" v-else-if="queryResult?.boolean !== undefined">
+          <el-result
+            :icon="queryResult.boolean ? 'success' : 'error'"
+            :title="queryResult.boolean ? 'TRUE' : 'FALSE'"
+          />
+        </div>
+
+        <!-- 空状态 -->
+        <div class="result-empty" v-else>
+          <el-empty description="执行查询后显示结果" :image-size="100" />
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import {computed, onBeforeUnmount, onMounted, ref} from 'vue'
+import {useRouter} from 'vue-router'
+import {executeSparql, fusekiApi, graphApi} from '@/api/index.js'
+import {ElMessage} from 'element-plus'
+import {
+  ArrowDown,
+  Clock,
+  CopyDocument,
+  Delete,
+  Download,
+  Edit,
+  Share,
+  VideoPlay,
+  WarningFilled
+} from '@element-plus/icons-vue'
+import {useGraphStore} from '@/stores/graphStore.js'
+
+// ── CodeMirror 6 ──────────────────────────────────────────────────────────
+import {EditorState} from '@codemirror/state'
+import {EditorView, highlightActiveLine, keymap, lineNumbers} from '@codemirror/view'
+import {defaultKeymap, history, historyKeymap, indentWithTab} from '@codemirror/commands'
+import {acceptCompletion, autocompletion, completionKeymap} from '@codemirror/autocomplete'
+import {StreamLanguage} from '@codemirror/language'
+// sparql 用 turtle 流式 language 做基本语法高亮（SPARQL 与 Turtle 关键字部分重叠）
+import {sparql as sparqlLang} from '@codemirror/legacy-modes/mode/sparql'
+
+const datasets = ref([])
+const selectedDataset = ref('')
+const sparqlText = ref(`SELECT ?s ?p ?o
+WHERE {
+  ?s ?p ?o
+}
+LIMIT 20`)
+const loading = ref(false)
+const queryResult = ref(null)
+const queryError = ref('')
+const cmContainer = ref(null)
+
+// 谓词缓存（按数据集）
+const predicateCache = ref([])
+
+let editorView = null  // CodeMirror 实例
+
+// ─── SPARQL 关键词 ─────────────────────────────────────────────────────────
+const SPARQL_KEYWORDS = [
+  'SELECT', 'DISTINCT', 'REDUCED', 'WHERE', 'FILTER', 'OPTIONAL', 'UNION', 'MINUS',
+  'GRAPH', 'NAMED', 'SERVICE', 'BIND', 'AS', 'VALUES', 'LET',
+  'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET',
+  'PREFIX', 'BASE', 'ASK', 'CONSTRUCT', 'DESCRIBE',
+  'INSERT', 'DELETE', 'WITH', 'LOAD', 'CLEAR', 'DROP', 'CREATE', 'COPY', 'MOVE', 'ADD',
+  'FROM', 'INTO', 'USING',
+  'NOT', 'IN', 'EXISTS', 'NOT EXISTS',
+  'TRUE', 'FALSE',
+  // 函数
+  'STR', 'LANG', 'LANGMATCHES', 'DATATYPE', 'BOUND', 'IRI', 'URI', 'BNODE',
+  'RAND', 'ABS', 'CEIL', 'FLOOR', 'ROUND', 'CONCAT', 'STRLEN', 'UCASE', 'LCASE',
+  'ENCODE_FOR_URI', 'CONTAINS', 'STRSTARTS', 'STRENDS', 'STRBEFORE', 'STRAFTER',
+  'YEAR', 'MONTH', 'DAY', 'HOURS', 'MINUTES', 'SECONDS', 'TIMEZONE', 'TZ', 'NOW',
+  'MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512',
+  'COALESCE', 'IF', 'STRLANG', 'STRDT', 'SAMETERM', 'ISIRI', 'ISURI', 'ISBLANK', 'ISLITERAL', 'ISNUMERIC',
+  'REGEX', 'SUBSTR', 'REPLACE',
+  'COUNT', 'SUM', 'MIN', 'MAX', 'AVG', 'SAMPLE', 'GROUP_CONCAT',
+  'isURI', 'isBlank', 'isLiteral', 'isNumeric',
+]
+
+// 常用前缀
+const PREFIXES = [
+  { label: 'rdf:', apply: '<http://www.w3.org/1999/02/22-rdf-syntax-ns#', info: 'RDF 命名空间' },
+  { label: 'rdfs:', apply: '<http://www.w3.org/2000/01/rdf-schema#', info: 'RDFS 命名空间' },
+  { label: 'owl:', apply: '<http://www.w3.org/2002/07/owl#', info: 'OWL 命名空间' },
+  { label: 'xsd:', apply: '<http://www.w3.org/2001/XMLSchema#', info: 'XSD 数据类型' },
+  { label: 'skos:', apply: '<http://www.w3.org/2004/02/skos/core#', info: 'SKOS 命名空间' },
+  { label: 'dc:', apply: '<http://purl.org/dc/elements/1.1/', info: 'Dublin Core' },
+  { label: 'foaf:', apply: '<http://xmlns.com/foaf/0.1/', info: 'FOAF 命名空间' },
+  { label: 'schema:', apply: '<http://schema.org/', info: 'Schema.org' },
+]
+
+// rdf:type / rdfs:label 等常用属性快捷补全
+const COMMON_PROPS = [
+  { label: 'rdf:type', apply: '<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>' },
+  { label: 'rdfs:label', apply: '<http://www.w3.org/2000/01/rdf-schema#label>' },
+  { label: 'rdfs:comment', apply: '<http://www.w3.org/2000/01/rdf-schema#comment>' },
+  { label: 'rdfs:subClassOf', apply: '<http://www.w3.org/2000/01/rdf-schema#subClassOf>' },
+  { label: 'owl:sameAs', apply: '<http://www.w3.org/2002/07/owl#sameAs>' },
+]
+
+// ─── 自动补全函数 ──────────────────────────────────────────────────────────
+function sparqlCompletionSource(context) {
+  // 获取当前 token（单词 / < 开头的 URI / 变量）
+  const word = context.matchBefore(/[<\w?:][^\s,;{}\[\]()]*/)
+  if (!word && !context.explicit) return null
+  const token = word ? word.text : ''
+  const from = word ? word.from : context.pos
+
+  const options = []
+
+  // 1. SPARQL 关键词
+  const kwLower = token.toUpperCase()
+  for (const kw of SPARQL_KEYWORDS) {
+    if (kw.startsWith(kwLower) || kwLower === '') {
+      options.push({ label: kw, type: 'keyword', boost: 3 })
+    }
+  }
+
+  // 2. 前缀
+  for (const p of PREFIXES) {
+    if (p.label.startsWith(token) || token === '') {
+      options.push({ label: p.label, apply: p.apply, type: 'namespace', detail: p.info, boost: 2 })
+    }
+  }
+
+  // 3. 常用属性
+  for (const prop of COMMON_PROPS) {
+    if (prop.label.includes(token) || token.startsWith('<')) {
+      options.push({ label: prop.label, apply: prop.apply, type: 'property', boost: 2 })
+    }
+  }
+
+  // 4. 数据集谓词（动态）
+  for (const pred of predicateCache.value) {
+    const shortLabel = pred.replace(/^.*[#/]/, '')  // 取 URI 片段
+    if (!token || pred.includes(token) || shortLabel.toLowerCase().includes(token.toLowerCase())) {
+      options.push({
+        label: shortLabel,
+        apply: `<${pred}>`,
+        detail: pred,
+        type: 'property',
+        boost: 1,
+      })
+    }
+  }
+
+  // 5. 变量补全（扫描当前文档中已有的 ?xxx 变量名）
+  if (token.startsWith('?')) {
+    const docText = editorView?.state.doc.toString() || ''
+    const varNames = new Set([...docText.matchAll(/\?(\w+)/g)].map(m => m[1]))
+    for (const v of varNames) {
+      const full = '?' + v
+      if (full.startsWith(token)) {
+        options.push({ label: full, type: 'variable', boost: 4 })
+      }
+    }
+  }
+
+  return { from, options, validFor: /^[<\w?:][^\s]*$/ }
+}
+
+// ─── 初始化 CodeMirror ─────────────────────────────────────────────────────
+function initEditor() {
+  if (editorView) {
+    editorView.destroy()
+    editorView = null
+  }
+
+  const startState = EditorState.create({
+    doc: sparqlText.value,
+    extensions: [
+      lineNumbers(),
+      highlightActiveLine(),
+      history(),
+      StreamLanguage.define(sparqlLang),
+      autocompletion({
+        override: [sparqlCompletionSource],
+        activateOnTyping: true,
+        maxRenderedOptions: 30,
+      }),
+      keymap.of([
+        ...defaultKeymap,
+        ...historyKeymap,
+        ...completionKeymap,
+        indentWithTab,
+        {
+          key: 'Ctrl-Enter',
+          mac: 'Cmd-Enter',
+          run: () => { runQuery(); return true },
+        },
+        {
+          key: 'Tab',
+          run: acceptCompletion,
+        },
+      ]),
+      EditorView.updateListener.of(update => {
+        if (update.docChanged) {
+          sparqlText.value = update.state.doc.toString()
+        }
+      }),
+      EditorView.theme({
+        '&': { height: '100%', fontSize: '13px' },
+        '.cm-scroller': { overflow: 'auto', fontFamily: "'Fira Code','JetBrains Mono','Consolas',monospace", lineHeight: '1.6' },
+        '.cm-content': { padding: '12px 0' },
+        '.cm-line': { padding: '0 14px' },
+        '.cm-gutters': { background: '#f5f5f5', borderRight: '1px solid #e0e0e0', color: '#999' },
+        '.cm-activeLine': { background: '#f0f7ff' },
+        '.cm-tooltip.cm-tooltip-autocomplete': { zIndex: 999 },
+        '.cm-tooltip.cm-tooltip-autocomplete > ul > li': { padding: '3px 10px' },
+        '.cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected]': { background: '#409eff', color: '#fff' },
+      }),
+    ],
+  })
+
+  editorView = new EditorView({
+    state: startState,
+    parent: cmContainer.value,
+  })
+}
+
+// ─── 查询历史（localStorage） ─────────────────────────────────────────────
+const HISTORY_KEY = 'sparql_query_history'
+const HISTORY_MAX = 20
+const queryHistory = ref([])
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY)
+    queryHistory.value = raw ? JSON.parse(raw) : []
+  } catch {
+    queryHistory.value = []
+  }
+}
+
+function saveToHistory(dataset, sparql) {
+  const preview = sparql.replace(/\s+/g, ' ').trim().substring(0, 60)
+  const now = new Date()
+  const time = `${now.getMonth() + 1}/${now.getDate()} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+  const item = { dataset, sparql, preview, time }
+  // 去重（相同 dataset+sparql 只保留最新）
+  queryHistory.value = queryHistory.value.filter(
+    h => !(h.dataset === dataset && h.sparql === sparql)
+  )
+  queryHistory.value.unshift(item)
+  if (queryHistory.value.length > HISTORY_MAX) queryHistory.value = queryHistory.value.slice(0, HISTORY_MAX)
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(queryHistory.value))
+  } catch {}
+}
+
+function loadFromHistory(cmd) {
+  if (cmd === '__clear__') {
+    queryHistory.value = []
+    localStorage.removeItem(HISTORY_KEY)
+    ElMessage.success('历史记录已清空')
+    return
+  }
+  // 恢复数据集选择
+  if (cmd.dataset) {
+    const ds = datasets.value.find(d => d.name === cmd.dataset)
+    if (ds) selectedDataset.value = ds.name
+  }
+  // 恢复查询内容
+  sparqlText.value = cmd.sparql
+  if (editorView) {
+    editorView.dispatch({
+      changes: { from: 0, to: editorView.state.doc.length, insert: cmd.sparql }
+    })
+  }
+  ElMessage.success({ message: '已恢复历史查询', duration: 1200 })
+}
+
+// ─── 复制为单行 ────────────────────────────────────────────────────────────
+function copyAsSingleLine() {
+  if (!sparqlText.value.trim()) {
+    ElMessage.warning('查询内容为空')
+    return
+  }
+  const singleLine = sparqlText.value
+    .replace(/\r?\n/g, ' ')   // 换行 → 空格
+    .replace(/\t/g, ' ')       // Tab → 空格
+    .replace(/ {2,}/g, ' ')    // 多空格 → 单空格
+    .trim()
+  navigator.clipboard?.writeText(singleLine).then(() => {
+    ElMessage.success({ message: '已复制为单行', duration: 1500 })
+  }).catch(() => {
+    ElMessage.error('复制失败，请手动复制')
+  })
+}
+
+// ─── 生命周期 ──────────────────────────────────────────────────────────────
+onMounted(async () => {
+  try {
+    const res = await fusekiApi.datasets()
+    datasets.value = res.datasets || []
+    if (datasets.value.length) selectedDataset.value = datasets.value[0].name
+  } catch {
+    datasets.value = [{ name: 'travel_kg_v4', path: '/travel_kg_v4' }]
+    selectedDataset.value = 'travel_kg_v4'
+  }
+  initEditor()
+  // 初始加载谓词
+  if (selectedDataset.value) loadPredicates()
+  // 加载本地历史记录
+  loadHistory()
+})
+
+onBeforeUnmount(() => {
+  editorView?.destroy()
+})
+
+// 切换数据集时刷新谓词
+function onDatasetChange() {
+  loadPredicates()
+}
+
+async function loadPredicates() {
+  if (!selectedDataset.value) return
+  try {
+    const ds = datasets.value.find(d => d.name === selectedDataset.value)
+    const datasetPath = ds?.path || ('/' + selectedDataset.value)
+    const res = await graphApi.predicates(datasetPath)
+    predicateCache.value = res.predicates || []
+  } catch {
+    predicateCache.value = []
+  }
+}
+
+// ─── 执行查询 ──────────────────────────────────────────────────────────────
+async function runQuery() {
+  if (!sparqlText.value.trim()) return
+  if (!selectedDataset.value) {
+    ElMessage.warning('请先选择数据集')
+    return
+  }
+  loading.value = true
+  queryError.value = ''
+  queryResult.value = null
+  try {
+    const ds = datasets.value.find(d => d.name === selectedDataset.value)
+    const datasetPath = ds?.path || ('/' + selectedDataset.value)
+    const result = await executeSparql(datasetPath, sparqlText.value)
+    queryResult.value = result
+    // 执行成功后保存到历史
+    saveToHistory(selectedDataset.value, sparqlText.value)
+  } catch (e) {
+    queryError.value = e.response?.data || e.message || '查询失败'
+  } finally {
+    loading.value = false
+  }
+}
+
+// ─── 格式化 ───────────────────────────────────────────────────────────────
+function formatQuery() {
+  const keywords = ['SELECT', 'WHERE', 'FILTER', 'OPTIONAL', 'UNION', 'MINUS',
+                    'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'PREFIX',
+                    'ASK', 'CONSTRUCT', 'DESCRIBE', 'INSERT', 'DELETE', 'WITH']
+  let q = sparqlText.value
+  keywords.forEach(kw => {
+    q = q.replace(new RegExp('\\b' + kw + '\\b', 'gi'), kw)
+  })
+  const formatted = q.trim()
+  sparqlText.value = formatted
+  // 同步到 CodeMirror
+  if (editorView) {
+    editorView.dispatch({
+      changes: { from: 0, to: editorView.state.doc.length, insert: formatted }
+    })
+  }
+}
+
+function clearQuery() {
+  sparqlText.value = ''
+  if (editorView) {
+    editorView.dispatch({
+      changes: { from: 0, to: editorView.state.doc.length, insert: '' }
+    })
+  }
+}
+
+function loadExample(ex) {
+  sparqlText.value = ex.sparql
+  if (editorView) {
+    editorView.dispatch({
+      changes: { from: 0, to: editorView.state.doc.length, insert: ex.sparql }
+    })
+  }
+}
+
+// ─── 结果处理 ─────────────────────────────────────────────────────────────
+const tableColumns = computed(() => {
+  if (!queryResult.value?.head?.vars) return []
+  return queryResult.value.head.vars
+})
+
+const tableData = computed(() => {
+  const bindings = queryResult.value?.results?.bindings || []
+  return bindings.map(row => {
+    const flat = {}
+    tableColumns.value.forEach(col => {
+      flat[col] = row[col]?.value ?? ''
+    })
+    return flat
+  })
+})
+
+function isUri(val) {
+  return typeof val === 'string' && (val.startsWith('http://') || val.startsWith('https://'))
+}
+
+function copyUri(uri) {
+  navigator.clipboard?.writeText(uri)
+  ElMessage.success({ message: 'URI 已复制', duration: 1500 })
+}
+
+function exportCSV() {
+  if (!tableData.value.length) return
+  const cols = tableColumns.value
+  const rows = [cols.join(','), ...tableData.value.map(r => cols.map(c => `"${(r[c] || '').replace(/"/g, '""')}"`).join(','))]
+  const blob = new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = 'sparql-result.csv'; a.click()
+  URL.revokeObjectURL(url)
+}
+
+const router = useRouter()
+const graphStore = useGraphStore()
+
+function viewAsGraph() {
+  if (!sparqlText.value.trim()) {
+    ElMessage.warning('查询内容为空')
+    return
+  }
+  if (!selectedDataset.value) {
+    ElMessage.warning('请先选择数据集')
+    return
+  }
+  const ds = datasets.value.find(d => d.name === selectedDataset.value)
+  const datasetPath = ds?.path || ('/' + selectedDataset.value)
+  graphStore.setPendingSparql(datasetPath, sparqlText.value)
+  router.push('/graph')
+  ElMessage.success('已切换到图谱页，正在渲染结果...')
+}
+
+// 示例查询
+const examples = [
+  {
+    name: '查询所有三元组',
+    desc: '列出前20条三元组',
+    sparql: 'SELECT ?s ?p ?o\nWHERE { ?s ?p ?o }\nLIMIT 20',
+  },
+  {
+    name: '查询实体类型',
+    desc: '统计各类型实体数量',
+    sparql: `SELECT ?type (COUNT(?s) AS ?count)
+WHERE {
+  ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?type
+}
+GROUP BY ?type
+ORDER BY DESC(?count)
+LIMIT 20`,
+  },
+  {
+    name: '查询指定属性',
+    desc: '查找有 label 的实体',
+    sparql: `SELECT ?s ?label
+WHERE {
+  ?s <http://www.w3.org/2000/01/rdf-schema#label> ?label
+}
+LIMIT 30`,
+  },
+  {
+    name: '路径查询',
+    desc: '两跳关系路径',
+    sparql: `SELECT ?a ?p1 ?b ?p2 ?c
+WHERE {
+  ?a ?p1 ?b .
+  ?b ?p2 ?c .
+  FILTER(?a != ?c)
+}
+LIMIT 20`,
+  },
+  {
+    name: '关键词搜索',
+    desc: '模糊匹配 label',
+    sparql: `SELECT ?s ?label
+WHERE {
+  ?s <http://www.w3.org/2000/01/rdf-schema#label> ?label
+  FILTER(CONTAINS(LCASE(STR(?label)), "北京"))
+}
+LIMIT 20`,
+  },
+  {
+    name: 'ASK 存在判断',
+    desc: '判断是否存在某类节点',
+    sparql: `ASK {
+  ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?type
+}`,
+  },
+]
+</script>
+
+<style scoped>
+.sparql-view {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 56px);
+  overflow: hidden;
+}
+.toolbar {
+  background: #fff;
+  border-bottom: 1px solid #e4e7ed;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.hint { font-size: 12px; color: #aaa; }
+
+/* 历史记录下拉项 */
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 440px;
+  overflow: hidden;
+}
+.history-ds {
+  font-size: 11px;
+  font-weight: 600;
+  color: #409eff;
+  background: #ecf5ff;
+  border-radius: 3px;
+  padding: 1px 5px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.history-preview {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #303133;
+  font-family: monospace;
+  font-size: 12px;
+}
+.history-time {
+  font-size: 11px;
+  color: #c0c4cc;
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+.editor-result {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+.editor-wrap {
+  width: 460px;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid #e4e7ed;
+  background: #fff;
+}
+.editor-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+/* CodeMirror 容器 */
+.cm-container {
+  flex: 1;
+  overflow: hidden;
+  background: #fafafa;
+}
+/* 让 CodeMirror 内部填满容器 */
+.cm-container :deep(.cm-editor) {
+  height: 100%;
+}
+.cm-container :deep(.cm-scroller) {
+  height: 100%;
+}
+.error-bar {
+  padding: 8px 14px;
+  background: #fef0f0;
+  color: #f56c6c;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-top: 1px solid #fde;
+  flex-shrink: 0;
+}
+.examples-panel {
+  border-top: 1px solid #f0f0f0;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 8px;
+  background: #fff;
+  flex-shrink: 0;
+}
+.examples-title {
+  font-size: 11px;
+  color: #999;
+  font-weight: 600;
+  padding: 4px 4px 6px;
+  text-transform: uppercase;
+}
+.example-item {
+  padding: 7px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.15s;
+}
+.example-item:hover { background: #f0f7ff; border-color: #c6e2ff; }
+.ex-name { font-size: 13px; font-weight: 500; color: #303133; }
+.ex-desc { font-size: 11px; color: #909399; margin-top: 2px; }
+
+.result-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #fff;
+}
+.result-header {
+  padding: 10px 16px;
+  border-bottom: 1px solid #f0f0f0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.result-count { font-size: 13px; color: #606266; flex: 1; }
+.result-table-wrap {
+  flex: 1;
+  overflow: hidden;
+}
+.uri-cell {
+  color: #409eff;
+  cursor: pointer;
+  font-size: 12px;
+}
+.uri-cell:hover { text-decoration: underline; }
+.ask-result, .result-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+</style>
+

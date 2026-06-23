@@ -1,0 +1,48 @@
+server:
+  port: 3040          # Spring Boot 应用端口（REST API / Actuator）
+
+spring:
+  application:
+    name: jena-fuseki-plus-server
+
+# Actuator 监控端点配置
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+# -------------------------------------------------------
+# Fuseki 嵌入式服务配置（自定义命名空间 fuseki.*）
+# -------------------------------------------------------
+fuseki:
+  # Fuseki 监听端口（独立于 Spring Boot 的 8080 端口）
+  port: 3030
+
+  # FUSEKI_HOME：apache-jena-fuseki-4.10.0 目录，留空则自动推断为 {jar所在目录}/libs/apache-jena-fuseki-4.10.0
+  home: ""
+
+  # FUSEKI_BASE：运行目录（存放数据集/配置/日志），留空则自动推断为 {jar所在目录}/run
+  base: ""
+
+  # 等待 Fuseki 就绪的超时秒数
+  start-timeout-seconds: 60
+
+  # 是否允许 SPARQL Update（写操作）
+  allow-update: true
+
+  # TTL 数据集配置文件路径（优先级最高）；留空则从 FUSEKI_BASE/configuration/ 自动扫描
+  config-file: ""
+
+  # 快速内存数据集（仅开发/测试用）；与 config-file 互斥
+  mem-dataset: false
+
+  # 内存数据集挂载路径（mem-dataset=true 时生效）
+  dataset-path: "/ds"
+
+  # 是否开启 Fuseki 详细日志
+  verbose: false
+
