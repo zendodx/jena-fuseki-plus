@@ -176,6 +176,7 @@ import {defaultKeymap, history, historyKeymap, indentWithTab} from '@codemirror/
 import {acceptCompletion, autocompletion, completionKeymap} from '@codemirror/autocomplete'
 import {HighlightStyle, StreamLanguage, syntaxHighlighting} from '@codemirror/language'
 import {tags} from '@lezer/highlight'
+import {linter, lintGutter, lintKeymap} from '@codemirror/lint'
 // sparql 流式语言模式
 import {sparql as sparqlLang} from '@codemirror/legacy-modes/mode/sparql'
 
@@ -366,6 +367,217 @@ function sparqlCompletionSource(context) {
   return { from, options, validFor: /^[<\w?:][^\s]*$/ }
 }
 
+// ─── SPARQL Lint 语法检查器 ────────────────────────────────────────────────
+/**
+ * CodeMirror linter source：对文档做规则检查，返回 Diagnostic 列表
+ * 每条 Diagnostic: { from, to, severity: 'error'|'warning', message }
+ */
+function sparqlLintSource(view) {
+  const text = view.state.doc.toString()
+  const diagnostics = []
+
+  // 工具：在原文中定位某个 token 的偏移（从 searchFrom 开始的第一次出现）
+  function findOffset(token, searchFrom = 0) {
+    const idx = text.indexOf(token, searchFrom)
+    return idx === -1 ? null : idx
+  }
+
+  // 工具：正则匹配并记录所有位置
+  function scanPattern(re, severity, getMessage) {
+    let m
+    const r = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g')
+    while ((m = r.exec(text)) !== null) {
+      const msg = typeof getMessage === 'function' ? getMessage(m) : getMessage
+      if (msg) diagnostics.push({ from: m.index, to: m.index + m[0].length, severity, message: msg })
+    }
+  }
+
+  // ── 规则 1: 括号配对检查（小括号 圆括号） ─────────────────────────────
+  {
+    const stack = []
+    // 跳过字符串和 URI 内容（简单状态机）
+    let inStr = null
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i]
+      // 进入/退出字符串
+      if (!inStr && (ch === '"' || ch === "'")) { inStr = ch; continue }
+      if (inStr && ch === inStr && text[i - 1] !== '\\') { inStr = null; continue }
+      if (inStr) continue
+      // 跳过 URI <...>
+      if (ch === '<') { const end = text.indexOf('>', i + 1); if (end !== -1) { i = end; continue } }
+      // 跳过注释 #...
+      if (ch === '#') { const nl = text.indexOf('\n', i + 1); i = nl === -1 ? text.length : nl; continue }
+
+      if (ch === '(') stack.push(i)
+      else if (ch === ')') {
+        if (stack.length === 0) {
+          diagnostics.push({ from: i, to: i + 1, severity: 'error', message: '多余的右括号 )，没有匹配的左括号' })
+        } else {
+          stack.pop()
+        }
+      }
+    }
+    for (const pos of stack) {
+      diagnostics.push({ from: pos, to: pos + 1, severity: 'error', message: '括号未关闭，缺少匹配的右括号 )' })
+    }
+  }
+
+  // ── 规则 2: 花括号配对检查 ────────────────────────────────────────────
+  {
+    const stack = []
+    let inStr = null
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i]
+      if (!inStr && (ch === '"' || ch === "'")) { inStr = ch; continue }
+      if (inStr && ch === inStr && text[i - 1] !== '\\') { inStr = null; continue }
+      if (inStr) continue
+      if (ch === '<') { const end = text.indexOf('>', i + 1); if (end !== -1) { i = end; continue } }
+      if (ch === '#') { const nl = text.indexOf('\n', i + 1); i = nl === -1 ? text.length : nl; continue }
+
+      if (ch === '{') stack.push(i)
+      else if (ch === '}') {
+        if (stack.length === 0) {
+          diagnostics.push({ from: i, to: i + 1, severity: 'error', message: '多余的右花括号 }，没有匹配的左花括号' })
+        } else {
+          stack.pop()
+        }
+      }
+    }
+    for (const pos of stack) {
+      diagnostics.push({ from: pos, to: pos + 1, severity: 'error', message: '花括号未关闭，缺少匹配的右花括号 }' })
+    }
+  }
+
+  // ── 规则 3: PREFIX 声明格式检查 ───────────────────────────────────────
+  // 正确格式: PREFIX name: <URI>
+  {
+    const re = /\bPREFIX\b([^\n<{]*)/gi
+    let m
+    while ((m = re.exec(text)) !== null) {
+      const after = m[1]
+      // 必须有 "词:" 再跟 URI（<...>），否则格式有误
+      // 允许空白，如: PREFIX  foo: <http://...>
+      if (!/^\s+[\w-]*:\s*$/.test(after) && !/^\s+[\w-]*:\s*</.test(text.substring(m.index, m.index + m[0].length + 100))) {
+        diagnostics.push({
+          from: m.index,
+          to: m.index + m[0].length,
+          severity: 'error',
+          message: 'PREFIX 声明格式不正确，应为: PREFIX prefix: <URI>',
+        })
+      }
+    }
+  }
+
+  // ── 规则 4: SELECT 后面必须有变量或 * ─────────────────────────────────
+  {
+    const re = /\bSELECT\b([ \t]+(DISTINCT|REDUCED))?[ \t]+([^\n{]*)/gi
+    let m
+    while ((m = re.exec(text)) !== null) {
+      const vars = m[3]?.trim()
+      if (vars && !vars.startsWith('?') && !vars.startsWith('*') && !vars.startsWith('(')) {
+        diagnostics.push({
+          from: m.index,
+          to: m.index + m[0].length,
+          severity: 'error',
+          message: 'SELECT 后应跟变量（?var）、* 或表达式 (expr AS ?var)',
+        })
+      }
+    }
+  }
+
+  // ── 规则 5: FILTER 后必须紧跟括号 ────────────────────────────────────
+  {
+    const re = /\bFILTER\b(\s*)([^\s(]?)/gi
+    let m
+    while ((m = re.exec(text)) !== null) {
+      // FILTER NOT EXISTS 是合法的
+      if (/NOT\s+EXISTS/i.test(text.substring(m.index + 6, m.index + 20))) continue
+      if (m[2] && m[2] !== '(') {
+        diagnostics.push({
+          from: m.index,
+          to: m.index + 6,
+          severity: 'error',
+          message: 'FILTER 后应紧跟括号，如 FILTER(?x > 0)',
+        })
+      }
+    }
+  }
+
+  // ── 规则 6: 变量名格式（? 后必须有字母/数字/下划线） ─────────────────
+  {
+    const re = /\?([^a-zA-Z0-9_\u00C0-\uFFFF])/g
+    let m
+    while ((m = re.exec(text)) !== null) {
+      // 跳过 FILTER 中 ? 作运算符（FILTER(? ...) 是无效写法）
+      if (m[1] === ' ' || m[1] === ')' || m[1] === '\n' || m[1] === '\r') {
+        diagnostics.push({
+          from: m.index,
+          to: m.index + 1,
+          severity: 'warning',
+          message: '? 后应跟变量名（字母/数字/下划线），否则可能引起解析错误',
+        })
+      }
+    }
+  }
+
+  // ── 规则 7: URI 格式（< 开头但未闭合 >） ─────────────────────────────
+  {
+    const re = /<(?!http|HTTP)[^>\s]*(?:\s[^>]*)?$/gm
+    let m
+    while ((m = re.exec(text)) !== null) {
+      // 忽略比较运算符 <=
+      if (text[m.index + 1] === '=') continue
+      diagnostics.push({
+        from: m.index,
+        to: m.index + m[0].length,
+        severity: 'error',
+        message: 'URI 未正确闭合，应以 > 结尾',
+      })
+    }
+  }
+
+  // ── 规则 8: 未声明的前缀使用（如 foo:bar 但没有 PREFIX foo:） ────────
+  {
+    // 收集已声明前缀
+    const declaredPrefixes = new Set(['rdf', 'rdfs', 'owl', 'xsd', 'skos', 'dc', 'foaf', 'schema'])
+    const prefixDecl = /\bPREFIX\s+([\w-]*):/gi
+    let pm
+    while ((pm = prefixDecl.exec(text)) !== null) declaredPrefixes.add(pm[1])
+
+    // 扫描前缀使用（word: 形式，排除 http:/ https:）
+    const useRe = /\b([\w][\w-]*):([\w])/g
+    let um
+    while ((um = useRe.exec(text)) !== null) {
+      const prefix = um[1].toLowerCase()
+      if (prefix === 'http' || prefix === 'https' || prefix === 'urn') continue
+      if (!declaredPrefixes.has(um[1]) && !declaredPrefixes.has(prefix)) {
+        diagnostics.push({
+          from: um.index,
+          to: um.index + um[1].length + 1,
+          severity: 'warning',
+          message: `前缀 "${um[1]}:" 未声明，请在查询头部添加 PREFIX ${um[1]}: <URI>`,
+        })
+      }
+    }
+  }
+
+  // ── 规则 9: LIMIT/OFFSET 后必须是正整数 ──────────────────────────────
+  scanPattern(
+    /\b(LIMIT|OFFSET)\b\s+([^\d\s{}\n][^\n]*)/i,
+    'error',
+    (m) => `${m[1]} 后应跟正整数，如 ${m[1]} 100`
+  )
+
+  // ── 规则 10: ORDER BY/GROUP BY 后面不能直接接 { ─────────────────────
+  scanPattern(
+    /\b(ORDER BY|GROUP BY)\b\s*\{/i,
+    'error',
+    (m) => `${m[1]} 后缺少排序/分组变量`
+  )
+
+  return diagnostics
+}
+
 // ─── 初始化 CodeMirror ─────────────────────────────────────────────────────
 function initEditor() {
   if (editorView) {
@@ -390,6 +602,7 @@ function initEditor() {
         ...defaultKeymap,
         ...historyKeymap,
         ...completionKeymap,
+        ...lintKeymap,
         indentWithTab,
         {
           key: 'Ctrl-Enter',
@@ -406,6 +619,8 @@ function initEditor() {
           sparqlText.value = update.state.doc.toString()
         }
       }),
+      lintGutter(),
+      linter(sparqlLintSource, { delay: 600 }),
       EditorView.theme({
         '&': { height: '100%', fontSize: '13px' },
         '.cm-scroller': { overflow: 'auto', fontFamily: "'Fira Code','JetBrains Mono','Consolas',monospace", lineHeight: '1.6' },
@@ -416,6 +631,11 @@ function initEditor() {
         '.cm-tooltip.cm-tooltip-autocomplete': { zIndex: 999 },
         '.cm-tooltip.cm-tooltip-autocomplete > ul > li': { padding: '3px 10px' },
         '.cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected]': { background: '#409eff', color: '#fff' },
+        // lint gutter 图标颜色（不覆盖 backgroundImage，波浪线由 lint 自身 SVG 实现）
+        '.cm-lint-marker-error': { color: '#f56c6c' },
+        '.cm-lint-marker-warning': { color: '#e6a23c' },
+        // lint tooltip 样式
+        '.cm-tooltip-lint': { zIndex: 9999 },
       }),
     ],
   })
