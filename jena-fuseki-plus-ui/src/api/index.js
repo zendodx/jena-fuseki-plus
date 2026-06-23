@@ -68,8 +68,8 @@ export const fusekiApi = {
 }
 
 // ---- SPARQL 执行（通过后端代理转发给 Fuseki，避免跨域） ----
-export async function executeSparql(datasetPath, sparql) {
+export async function executeSparql(datasetPath, sparql, signal) {
   // 统一走 /api/fuseki/sparql，由 Spring Boot 代理转发给 Fuseki (3030)
-  return http.post('/fuseki/sparql', { dataset: datasetPath, query: sparql })
+  return http.post('/fuseki/sparql', { dataset: datasetPath, query: sparql }, { signal })
 }
 

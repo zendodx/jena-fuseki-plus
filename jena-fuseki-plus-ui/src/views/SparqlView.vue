@@ -9,6 +9,7 @@
       <el-button type="primary" @click="runQuery" :loading="loading" :icon="VideoPlay">
         执行查询
       </el-button>
+      <el-button v-if="loading" type="danger" plain @click="cancelQuery">取消</el-button>
       <el-button @click="formatQuery" :icon="Edit">格式化</el-button>
       <el-button @click="copyAsSingleLine" :icon="CopyDocument" title="复制为单行（去除换行）">复制单行</el-button>
       <el-button @click="clearQuery" :icon="Delete">清空</el-button>
@@ -71,8 +72,20 @@
       <div class="result-wrap">
         <div class="result-header" v-if="queryResult">
           <span class="result-count">
-            共 {{ queryResult.results?.bindings?.length || 0 }} 条结果
+            共 <b>{{ totalCount }}</b> 条结果
+            <span v-if="totalCount > PAGE_SIZE" class="page-info">
+              · 第 {{ currentPage }}/{{ totalPages }} 页
+            </span>
           </span>
+          <!-- 大结果集警告 -->
+          <el-tag
+            v-if="isTruncated"
+            type="warning"
+            size="small"
+            style="margin-left:4px"
+            :title="`结果超过 ${WARN_THRESHOLD} 条，建议查询时加 LIMIT 限制返回数量`"
+          >⚠ 结果过多，建议加 LIMIT</el-tag>
+          <div style="flex:1"></div>
           <el-button size="small" @click="exportCSV" :icon="Download">导出 CSV</el-button>
           <el-button size="small" @click="viewAsGraph" :icon="Share" type="primary" plain>
             在图谱中查看
@@ -82,7 +95,7 @@
         <!-- 结果表格 -->
         <div class="result-table-wrap" v-if="queryResult?.results?.bindings?.length">
           <el-table
-            :data="tableData"
+            :data="pagedTableData"
             border
             stripe
             height="100%"
@@ -120,6 +133,19 @@
         <div class="result-empty" v-else>
           <el-empty description="执行查询后显示结果" :image-size="100" />
         </div>
+
+        <!-- 分页控件 -->
+        <div class="result-pagination" v-if="totalPages > 1">
+          <el-pagination
+            v-model:current-page="currentPage"
+            :page-size="PAGE_SIZE"
+            :total="totalCount"
+            :page-sizes="[50, 100, 200, 500]"
+            layout="total, sizes, prev, pager, next, jumper"
+            @size-change="onPageSizeChange"
+            small
+          />
+        </div>
       </div>
     </div>
   </div>
@@ -152,6 +178,11 @@ import {HighlightStyle, StreamLanguage, syntaxHighlighting} from '@codemirror/la
 import {tags} from '@lezer/highlight'
 // sparql 流式语言模式
 import {sparql as sparqlLang} from '@codemirror/legacy-modes/mode/sparql'
+
+// 大结果集阈值：超过此条数展示警告
+const WARN_THRESHOLD = 500
+// 分页大小默认值
+const PAGE_SIZE_DEFAULT = 100
 
 // ── SPARQL 自定义语法高亮主题 ──────────────────────────────────────────────
 const sparqlHighlightStyle = HighlightStyle.define([
@@ -512,19 +543,35 @@ async function runQuery() {
     ElMessage.warning('请先选择数据集')
     return
   }
+  // 如有正在进行的查询，先取消
+  if (abortController) abortController.abort()
+  abortController = new AbortController()
+
   loading.value = true
   queryError.value = ''
   queryResult.value = null
+  currentPage.value = 1
   try {
     const ds = datasets.value.find(d => d.name === selectedDataset.value)
     const datasetPath = ds?.path || ('/' + selectedDataset.value)
-    const result = await executeSparql(datasetPath, sparqlText.value)
+    const result = await executeSparql(datasetPath, sparqlText.value, abortController.signal)
     queryResult.value = result
+    // 大结果集提示
+    const count = result?.results?.bindings?.length || 0
+    if (count > WARN_THRESHOLD) {
+      ElMessage.warning({
+        message: `返回 ${count} 条结果，建议在查询中加入 LIMIT 限制返回数量`,
+        duration: 4000,
+      })
+    }
     // 执行成功后保存到历史
     saveToHistory(selectedDataset.value, sparqlText.value)
   } catch (e) {
+    // AbortError 是用户主动取消，不显示错误
+    if (e?.name === 'AbortError' || e?.code === 'ERR_CANCELED') return
     queryError.value = e.response?.data || e.message || '查询失败'
   } finally {
+    abortController = null
     loading.value = false
   }
 }
@@ -665,12 +712,28 @@ function loadExample(ex) {
   }
 }
 
-// ─── 结果处理 ─────────────────────────────────────────────────────────────
+// ─── 查询取消（AbortController） ──────────────────────────────────────────────────
+let abortController = null
+
+function cancelQuery() {
+  if (abortController) {
+    abortController.abort()
+    abortController = null
+  }
+  loading.value = false
+  ElMessage.info({ message: '查询已取消', duration: 1500 })
+}
+
+// ─── 结果处理（分页） ──────────────────────────────────────────────────
+const PAGE_SIZE = ref(PAGE_SIZE_DEFAULT)
+const currentPage = ref(1)
+
 const tableColumns = computed(() => {
   if (!queryResult.value?.head?.vars) return []
   return queryResult.value.head.vars
 })
 
+// 全量扁平数据（不分页，用于导出 CSV）
 const tableData = computed(() => {
   const bindings = queryResult.value?.results?.bindings || []
   return bindings.map(row => {
@@ -681,6 +744,21 @@ const tableData = computed(() => {
     return flat
   })
 })
+
+const totalCount = computed(() => tableData.value.length)
+const totalPages = computed(() => Math.ceil(totalCount.value / PAGE_SIZE.value))
+const isTruncated = computed(() => totalCount.value > WARN_THRESHOLD)
+
+// 当前页切片数据（传给 el-table）
+const pagedTableData = computed(() => {
+  const start = (currentPage.value - 1) * PAGE_SIZE.value
+  return tableData.value.slice(start, start + PAGE_SIZE.value)
+})
+
+function onPageSizeChange(size) {
+  PAGE_SIZE.value = size
+  currentPage.value = 1
+}
 
 function isUri(val) {
   return typeof val === 'string' && (val.startsWith('http://') || val.startsWith('https://'))
@@ -941,10 +1019,20 @@ LIMIT 20`,
   gap: 8px;
   flex-shrink: 0;
 }
-.result-count { font-size: 13px; color: #606266; flex: 1; }
+.result-count { font-size: 13px; color: #606266; flex-shrink: 0; }
+.page-info { color: #909399; margin-left: 4px; }
 .result-table-wrap {
   flex: 1;
   overflow: hidden;
+  min-height: 0;
+}
+.result-pagination {
+  padding: 8px 16px;
+  border-top: 1px solid #f0f0f0;
+  background: #fff;
+  flex-shrink: 0;
+  display: flex;
+  justify-content: flex-end;
 }
 .uri-cell {
   color: #409eff;
