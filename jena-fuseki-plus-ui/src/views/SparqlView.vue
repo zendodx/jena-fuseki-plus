@@ -864,8 +864,8 @@ function sparqlFormat(query) {
   // 先把所有换行压平成空格
   q = q.replace(/\n/g, ' ').replace(/ {2,}/g, ' ')
 
-  // 顶级关键词前加换行：在"空格 + 顶级关键词"处替换为"\n顶级关键词"
-  // 注意多词关键词（GROUP BY / ORDER BY 等）先处理，避免被单词拆散
+  // 顶级子句关键词前加换行（SELECT/WHERE/PREFIX/LIMIT 等）
+  // 多词关键词先处理，避免被单词拆散
   const TOP_KW = [
     'INSERT DATA', 'DELETE DATA', 'GROUP BY', 'ORDER BY',
     'PREFIX', 'BASE', 'SELECT', 'ASK', 'CONSTRUCT', 'DESCRIBE',
@@ -874,11 +874,24 @@ function sparqlFormat(query) {
     'WHERE', 'FROM', 'NAMED', 'HAVING', 'LIMIT', 'OFFSET', 'VALUES',
   ]
   for (const kw of TOP_KW) {
-    // 将字符串中所有 " KEYWORD"（前有空格，后跟空格或{或行尾）替换为 "\nKEYWORD"
-    // 用 replace + 全局匹配，不依赖 lookbehind
     const pat = kw.replace(/ /g, '\\s+')
     q = q.replace(new RegExp(' (' + pat + ')(?=[ \\t{]|$)', 'gi'), '\n$1')
   }
+
+  // { } 内部块级子句关键词前加换行
+  // 这些关键词在花括号内出现时必须单独占行
+  // 匹配规则：前面有非换行内容（已有空格）+ 关键词 + 后跟空格或 (
+  const BLOCK_KW = [
+    'NOT EXISTS',   // 多词优先
+    'OPTIONAL', 'UNION', 'MINUS', 'GRAPH', 'SERVICE',
+    'FILTER', 'BIND', 'LET',
+    'SUBQUERY',
+  ]
+  for (const kw of BLOCK_KW) {
+    const pat = kw.replace(/ /g, '\\s+')
+    q = q.replace(new RegExp(' (' + pat + ')(?=[ \\t({]|$)', 'gi'), '\n$1')
+  }
+
   // 去掉可能产生的行首多余空格
   q = q.split('\n').map(l => l.trimStart()).join('\n')
 
@@ -930,8 +943,27 @@ function sparqlFormat(query) {
         /([^\d\x00])\.\s+(?=[^}\s])/g,
         (_, pre) => pre + '.\n' + lineIndent
       )
-      // 3. 处理逗号：", " → ",\n缩进+4空格"
-      expanded = expanded.replace(/,\s+/g, ',\n' + lineIndent + INDENT + INDENT)
+      // 3. 处理顶层逗号（同谓词多宾语）：只展开不在括号内的逗号
+      //    遍历字符，跳过 (...) 和 [...] 内的逗号（函数参数/集合）
+      {
+        let parenDepth = 0
+        let result2 = ''
+        for (let ci = 0; ci < expanded.length; ci++) {
+          const c = expanded[ci]
+          if (c === '(' || c === '[') { parenDepth++; result2 += c; continue }
+          if (c === ')' || c === ']') { parenDepth--; result2 += c; continue }
+          if (c === ',' && parenDepth === 0) {
+            // 吞掉逗号后的空白，换行缩进
+            let j = ci + 1
+            while (j < expanded.length && (expanded[j] === ' ' || expanded[j] === '\t')) j++
+            result2 += ',\n' + lineIndent + INDENT + INDENT
+            ci = j - 1
+            continue
+          }
+          result2 += c
+        }
+        expanded = result2
+      }
       expandedLines.push(expanded)
     } else {
       expandedLines.push(rawLine)
