@@ -17,11 +17,6 @@ export default defineConfig({
         target: 'http://localhost:3040',
         changeOrigin: true,
       },
-      // 代理 Fuseki 原生接口（/travel_kg_v4 等）
-      '/travel_kg_v4': {
-        target: 'http://localhost:3030',
-        changeOrigin: true,
-      },
     },
   },
 })
