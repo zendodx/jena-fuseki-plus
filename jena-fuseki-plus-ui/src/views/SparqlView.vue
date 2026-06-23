@@ -679,11 +679,47 @@ function sparqlFormat(query) {
     if (line.endsWith('{')) depth++
   }
 
-  // ── Step 6: 点号分隔三元组换行 ────────────────────────────────────────
-  // depth=1 内部的 . 分隔符后换行（简单：在 . 后（不跟<>）加换行）
+  // ── Step 6: { } 内部三元组按句分行 ──────────────────────────────────
+  // 处理 .  ;  , 三种分隔符，在每个分隔符后换行并保持当前缩进层级
+  // 规则：
+  //   . 句末（三元组结束）→ 换行，下一条三元组保持同层缩进
+  //   ; （同主语多谓词）→ 换行 + 额外2空格（对齐谓词）
+  //   , （同谓词多宾语）→ 换行 + 额外4空格（对齐宾语）
+  // 注意：不影响 URI 占位符内的点（\x00URIn\x00 中无 . ）、小数（数字前后）
   let out = result.join('\n')
-  // 在 triple 末尾的 . 后换行（不影响 URI 和小数）
-  out = out.replace(/(?<=[^.<>\d]) \. (?=[^}])/g, ' .\n' + INDENT.repeat(1))
+  // 逐行处理，只对 { } 内部的行（depth>0）做分隔符展开
+  const splitLines = out.split('\n')
+  let blockDepth = 0
+  const expandedLines = []
+  for (const rawLine of splitLines) {
+    const trimmed = rawLine.trim()
+    if (trimmed === '}') { blockDepth = Math.max(0, blockDepth - 1) }
+    const lineIndent = INDENT.repeat(blockDepth)
+
+    if (blockDepth > 0 && trimmed && trimmed !== '{' && trimmed !== '}') {
+      // 在花括号内部，展开分隔符
+      // 先按 . 分割三元组（但要避免切断 URI 占位符、小数、行末单独的 .）
+      // 策略：将行内所有 ". "（点+空格，点不紧贴数字/占位符结尾）替换为 ".\n缩进"
+      let expanded = rawLine
+      // 1. 处理分号："; " → ";\n缩进+2空格"（同主语续行缩进对齐）
+      expanded = expanded.replace(/;\s+/g, ';\n' + lineIndent + INDENT)
+      // 2. 处理句末点号（三元组分隔）
+      //    匹配：非数字、非占位符结尾 + "." + 空格 + 非"}"
+      //    也匹配紧贴词尾的点（如 ?name. ?x）
+      expanded = expanded.replace(
+        /([^\d\x00])\.\s+(?=[^}\s])/g,
+        (_, pre) => pre + '.\n' + lineIndent
+      )
+      // 3. 处理逗号：", " → ",\n缩进+4空格"
+      expanded = expanded.replace(/,\s+/g, ',\n' + lineIndent + INDENT + INDENT)
+      expandedLines.push(expanded)
+    } else {
+      expandedLines.push(rawLine)
+    }
+
+    if (trimmed.endsWith('{')) { blockDepth++ }
+  }
+  out = expandedLines.join('\n')
 
   // ── Step 7: 还原占位符 ────────────────────────────────────────────────
   out = out.replace(/\x00(URI|STR|CMT)(\d+)\x00/g, (_, type, idx) => placeholders[parseInt(idx)])
